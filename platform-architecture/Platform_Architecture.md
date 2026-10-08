@@ -1,7 +1,9 @@
 # Platform Architecture: Unified Infrastructure, AI Usage and Security Monitoring
 
 ## 1. Overview
-This is a multi-tenant SaaS platform. Customers install one agent on their VMs and get one place to see:
+**Scope (current): internal platform for our own company.** We use it to manage our own servers, GPU/AI infrastructure, AI usage and security. The design stays *multi-tenant-ready* (every table keeps a `tenant_id`, with one tenant today), so selling it later does not require a rewrite. Items that only matter for external customers are marked **(SaaS later)**.
+
+An agent installed on each VM gives one place to see:
 - **Infrastructure health:** CPU, RAM, disk, network, GPU, load, swap and per-core metrics, collected every second as described in [Frequency of Data Collection](../data-collection-frequency/Frequency%20of%20Data%20Collection.md).
 - **AI usage:** self-hosted LLMs (Ollama/vLLM on GPUs) and cloud AI APIs (OpenAI, Anthropic, Gemini). It covers tokens, cost, latency, errors and safety.
 - **Security:** the Observe → Audit → Detect → Scan → Respond model from [Linux Server Monitoring and Security Visibility](../linux-server-monitoring-security/Linux_Server_Monitoring_and_Security_Visibility.md), using Netdata, auditd, Wazuh, ClamAV and Fail2Ban.
@@ -13,7 +15,7 @@ This is a multi-tenant SaaS platform. Customers install one agent on their VMs a
 |---|---|
 | Collection | Hybrid. Netdata for metrics, plus our own lightweight agent for AI, security events and heartbeat |
 | Backend | Python, FastAPI |
-| Scale | 100+ servers per tenant, many tenants |
+| Scale | 100+ servers; one tenant (our company) now, many tenants **(SaaS later)** |
 | AI usage scope | Self-hosted and cloud AI |
 
 ## 2. Guiding Principle: Three Intelligence Tiers
@@ -49,7 +51,7 @@ This is a multi-tenant SaaS platform. Customers install one agent on their VMs a
 │                    per-request tokens, cost, latency, user/team tags          │
 └───────────────────────────────────┬───────────────────────────────────────────┘
                                     │
-┌──────────────────────────── PLATFORM (SaaS) ─────────────────────────────────┐
+┌──────────────────────────── PLATFORM (internal, SaaS-ready) ─────────────────────────────────┐
 │ Edge: API gateway / WAF · rate limit per tenant · agent auth (mTLS + API key) │
 │                                                                               │
 │ Ingestion                                                                     │
@@ -122,7 +124,7 @@ This is a multi-tenant SaaS platform. Customers install one agent on their VMs a
 | Table | Key fields |
 |---|---|
 | `tenants`, `users`, `memberships` | plan, limits, roles, SSO config |
-| `hosts` | tenant_id, hostname, labels, cloud ids, agent_version, last_seen |
+| `assets` (was `hosts`) | tenant_id, type, hostname, labels, cloud ids, owner, criticality, agent_version, last_seen (see §10.1) |
 | `metrics` (hypertable) | tenant_id, host_id, metric (`system.cpu.user`…), ts, value |
 | `events` | tenant_id, host_id, source (wazuh/auditd/fail2ban/clamav/agent), type, severity, payload, ts |
 | `incidents` | tenant_id, status, severity, rule_id, started/resolved, linked events, AI labels + probabilities, AI summary |
@@ -219,6 +221,7 @@ These are estimates to measure in production.
 - **Safe remediation runbooks:** human-approved one-click actions (restart service, block IP, kill process, isolate host), with every action logged.
 
 ### Platform
+*(Enterprise items below are **SaaS later**.)*
 - **Alert routing:** escalation policies, on-call schedules, snooze, maintenance windows, mobile push.
 - **Open integrations:** Prometheus remote-write and OpenTelemetry ingestion, a Grafana-compatible query API, webhooks, Slack and Teams bots ("Ask" from chat).
 - **Reports:** scheduled PDF and email reports, CSV and Parquet exports.
@@ -243,6 +246,8 @@ These are estimates to measure in production.
 | Observability of the platform | OpenTelemetry, Prometheus, Grafana; we monitor ourselves |
 
 ## 8. Multi-Tenancy, Security and Scaling
+*Internal now, one tenant. Per-tenant quotas, dedicated databases/regions and tenant AI-policy variety are **SaaS later**; `tenant_id` + RLS stay from day one.*
+
 - **Isolation:**
   - `tenant_id` is on every row, enforced by Postgres RLS.
   - Ingest is rate-limited and quota-limited per tenant.
@@ -279,4 +284,139 @@ backend/
 frontend/           Next.js dashboard
 deploy/             docker-compose, helm, terraform
 docs/               existing docs + this architecture + metric schema
+```
+
+## 10. Internal Compliance Module (our own SOC 2 / ISO 27001)
+**Scope:** makes *our own company* audit-ready (SOC 2 / ISO 27001). It runs on this same internal platform. If the platform is later sold as SaaS, customers will ask for SOC 2 too, so this work carries over.
+
+```
+Asset sources (agent, Wazuh, osquery, AWS, GitHub, Google Workspace)
+        │
+        ▼
+Asset Inventory (single source of truth)
+        │
+        ├─► Security baselines  (Wazuh SCA / CIS, Prowler for AWS)
+        ├─► Vulnerability mgmt  (Wazuh CVEs + remediation SLAs)
+        └─► Identity & access   (Google Workspace / GitHub / AWS IAM)
+                    │
+                    ▼
+        Control checks (Tier 0 code, deterministic)
+                    │
+           ┌────────┴────────┐
+           ▼                 ▼
+         PASS               FAIL
+     evidence saved     ticket + owner
+           │                 │
+           └────────┬────────┘
+                    ▼
+     Evidence store (S3 Object Lock, hashed, timestamped)
+                    │
+                    ▼
+        Control matrix + posture dashboard
+```
+
+### 10.1 Asset inventory
+- The `hosts` table becomes a general **`assets`** table covering servers, GPU/edge devices, laptops, cloud resources, databases, SaaS apps and repositories.
+- Fields: owner, department, environment, criticality, data classification, OS/version, last seen, last scan, compliance status, EOL status, and links to related assets.
+- **Criticality** has four levels: Critical, High, Medium and Low. It sets how often each asset is checked, and it is also passed to Jev triage as an input.
+
+### 10.2 Controls and checks
+| Area | Source | Example checks |
+|---|---|---|
+| Servers | Wazuh SCA, our agent | SSH root login off, password auth off, firewall on, auditd on, NTP, patches |
+| Laptops | Wazuh agent + osquery/Fleet (no MDM built by us) | Disk encryption, screen lock, OS version, EDR running, local admins |
+| AWS | Prowler (ships SOC 2/ISO mappings), CloudTrail | Public S3, 0.0.0.0/0 security groups, root MFA, unused keys, encryption, logging, backups |
+| SaaS / identity | Google Workspace, GitHub, AWS IAM APIs | MFA coverage, admin list, inactive accounts, offboarded users still active |
+| Vulnerabilities | Wazuh | Remediation SLA: Critical 7d, High 14d, Medium 30d, Low 90d (set by our policy) |
+
+**Rules for checks**
+- All checks are Tier 0 code, so the same input always gives the same result, which is what auditors need.
+- AI only assists:
+  - Suggesting criticality.
+  - Drafting policies.
+  - Summarizing evidence.
+  - Flagging unused privileged access.
+
+### 10.3 Exceptions
+Every exception has:
+- Asset and control
+- Reason and risk
+- Approver
+- Compensating control
+- Mandatory expiry date
+
+An expired exception automatically turns the control back to failing.
+
+### 10.4 Access lifecycle
+- **Joiner, mover and leaver:** each step is a checklist item that records evidence.
+- **Leaver:** disable the Google account, revoke GitHub, AWS and VPN access, and recover the laptop.
+- **Access reviews:** monthly for Critical systems and quarterly for others. The result is stored as evidence.
+
+### 10.5 Evidence and control matrix
+- Common controls are mapped once to **SOC 2 (Security criteria first)** and **ISO 27001**, using the Secure Controls Framework as the crosswalk.
+- Evidence consists of API exports, scan reports, access reviews, incident records and policy acknowledgements.
+  - Every item is timestamped, hashed and stored write-once.
+  - Screenshots are used only when there is no other option.
+- The posture dashboard shows:
+  - Assets: compliant, non-compliant and unknown
+  - Coverage: MFA, encryption, EDR and patching
+  - Open and expired exceptions
+  - Readiness for each framework
+
+### 10.6 Build vs. buy
+| Part | Approach |
+|---|---|
+| Technical checks (servers, AWS, GitHub, Workspace) | **Build.** They reuse this platform's agent, Wazuh, connectors and rules engine |
+| Policies, security training, vendor reviews, auditor portal | **Use a simple tracker or a GRC tool.** Building these internally is not worth it |
+| Policies themselves (access control, vulnerability, incident response, backup, change management, acceptable use) | Written by the organization; Claude can draft them for review |
+
+## 11. AI Data Sandbox & Access Control
+**Principle:** the AI never holds credentials or database access. Every piece of data it sees passes through a checkpoint that enforces the *asking user's* permissions. This is enforced in the architecture, not by prompt instructions.
+
+**Internal-first scope:** the main risks today are (a) employees seeing data outside their role, (b) secrets in logs reaching an external model, and (c) injected text in logs steering the AI. Cross-customer isolation is a **(SaaS later)** concern, although `tenant_id` + RLS is kept because it is cheap.
+
+```
+User (JWT: role, asset scopes)
+   │ question
+   ▼
+AI Service ──► LLM (Claude / Jev)        ← no DB creds, no network tools, no write tools
+   │  model requests a tool call
+   ▼
+Read-only tool API  (user_id injected server-side, never from the model;
+   │                 role check in code, row/time caps)
+   ▼
+Redactor (secrets, tokens) → back to the LLM
+   │
+   └─► AI audit log: who asked, which tools, which rows, what was returned
+```
+
+### 11.1 v1 must-haves
+| Control | How it works |
+|---|---|
+| Permission inheritance | The Ask agent acts as the logged-in user and can never see more than that user can. User ID is injected server-side; Postgres RLS (`tenant_id`) is kept as a backstop |
+| Typed, limited tools | Read-only allowlisted tools only, with Pydantic-typed parameters and caps on rows and time range. No SQL, no shell, no write actions |
+| Secret redaction | Passwords, tokens, keys and auditd command lines are stripped before any model call |
+| Untrusted-data wrapping | Logs and events are passed as clearly marked data, never as instructions. With no write tools, a successful injection can only produce a wrong answer, not an action |
+| AI access log | Each answer and incident records exactly which data the AI accessed ("What did the AI see?"). Also SOC 2 evidence (§10.5) |
+| AI policy | `off` / `cloud` (zero-data-retention providers only) / `self-hosted only`, set per tenant (one today) |
+| Small AI red-team test set in CI | Cross-role and prompt-injection prompts; the build fails on any leak |
+
+### 11.2 Later, when there is a reason
+| Control | Add when |
+|---|---|
+| Data classification + tokenization (`HOST_7`, `USER_3`) | Prompts go to cloud models for sensitive assets, or a customer asks. Until then simple redaction is enough |
+| Break-glass access, two-person approval | Remediation runbooks exist for Critical assets |
+| Canary records (honeytokens) | After launch; a cheap alarm if fake secrets ever show up in a prompt |
+| Policy engine (OPA/Cedar) | Rules start varying per customer **(SaaS later)**; plain role checks are enough for a few internal roles |
+| Container isolation (gVisor/Firecracker) | Only if we add an AI feature that *runs code*. The current design calls fixed tools, so there is nothing to isolate |
+| Explainable denials | Nice UX; add alongside the Ask UI |
+
+### 11.3 Code location
+```
+backend/app/ai/sandbox/
+  tools/           read-only typed tools; server-side user injection
+  redact.py        secret/token stripping
+  audit.py         per-call AI access log
+  redteam/         injection + cross-role attack prompts for CI
+  (later) classify.py, tokenizer.py, canary.py, policy/
 ```
